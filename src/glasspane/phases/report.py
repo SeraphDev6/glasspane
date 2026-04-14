@@ -131,8 +131,15 @@ def _write_finding_report(
 Chains with: {', '.join(finding.chain_with)}
 """
 
-    filename = f"{finding.id}.md"
-    (output_dir / filename).write_text(content)
+    # Sanitize finding ID — model-controlled, could contain path separators
+    safe_id = "".join(c for c in finding.id if c.isalnum() or c in "-_.")
+    if not safe_id:
+        safe_id = "unknown"
+    filename = f"{safe_id}.md"
+    dest = (output_dir / filename).resolve()
+    if not dest.is_relative_to(output_dir.resolve()):
+        raise ValueError(f"Finding ID {finding.id!r} resolved outside output directory")
+    dest.write_text(content)
 
 
 def _write_summary(

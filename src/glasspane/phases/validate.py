@@ -7,13 +7,19 @@ against actual source code to separate real vulnerabilities from hallucinations.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 from rich.console import Console
 
-from glasspane.client import get_client, run_agent_loop
-from glasspane.models import Finding, ScanConfig, ScanProfile, ValidationResult, Verdict
-from glasspane.sandbox import Sandbox
+from glasspane.client import create_deps, create_phase_agent
+from glasspane.models import (
+    Finding,
+    ScanConfig,
+    ScanProfile,
+    ValidateOutput,
+    ValidationResult,
+    Verdict,
+)
+from glasspane.sandbox import GlasspaneSandbox
 
 console = Console()
 
@@ -38,34 +44,17 @@ IMPORTANT: Be skeptical. The previous researcher may have hallucinated code that
 
 {framework_mitigations}
 
-Use the read_file and grep tools to verify each finding. Read the actual code, not just the snippet provided.
+Use the available tools to verify each finding. Read the actual code, not just the snippet provided.
 
-Respond with a JSON array of validation results. Output ONLY the JSON array.
-
-Example:
-[
-  {{
-    "finding_id": "FIND-001",
-    "verdict": "confirmed",
-    "reasoning": "Verified Html::escape() at line 409. The function definitively does not escape LDAP metacharacters. The call chain from exposed filter to translateCondition is traceable.",
-    "adjusted_severity": null,
-    "poc_suggestion": "Submit ?cn=* to an exposed LDAP Views filter and observe all entries returned"
-  }},
-  {{
-    "finding_id": "FIND-002",
-    "verdict": "false_positive",
-    "reasoning": "The code uses parameterized queries via the framework DB abstraction. The reported SQL injection is not possible.",
-    "adjusted_severity": null,
-    "poc_suggestion": ""
-  }}
-]"""
+Return your validation results as structured output."""
 
 
-def run_validate_phase(
+async def run_validate_phase(
     config: ScanConfig,
     profile: ScanProfile,
     findings: list[Finding],
-    sandbox: Sandbox,
+    sandbox: GlasspaneSandbox,
+    verbose: bool = False,
 ) -> list[ValidationResult]:
     """Validate findings with an adversarial second opinion."""
     console.print("\n[bold blue]Phase 3: VALIDATE[/bold blue] — Adversarial verification of findings...")
@@ -77,7 +66,15 @@ def run_validate_phase(
     console.print(f"  Validating [bold]{len(findings)}[/bold] findings")
     console.print(f"  Using model: [cyan]{config.validate_model}[/cyan]")
 
-    client = get_client()
+    # Sanitize finding file paths — reject traversal outside the repo root
+    repo_root = config.target_path.resolve()
+    for f in findings:
+        try:
+            resolved = (repo_root / f.file_path).resolve()
+            if not resolved.is_relative_to(repo_root):
+                f.file_path = f"[rejected: {f.file_path}]"
+        except (ValueError, OSError):
+            f.file_path = f"[rejected: {f.file_path}]"
 
     # Build findings summary for the validator
     findings_json = json.dumps(
@@ -101,15 +98,18 @@ For each finding:
 4. Check framework mitigations — does the framework protect against this?
 5. Provide your verdict and reasoning"""
 
-    raw = run_agent_loop(
-        client=client,
+    agent, activity = create_phase_agent(
         model=config.validate_model,
-        system_prompt=system,
-        user_message=user_msg,
+        instructions=system,
+        output_type=ValidateOutput,
         sandbox=sandbox,
+        verbose=verbose,
     )
+    deps = create_deps(sandbox)
 
-    validations = _parse_validations(raw)
+    result = await agent.run(user_msg, deps=deps)
+    activity.clear_line()
+    validations = result.output.validations
 
     confirmed = sum(1 for v in validations if v.verdict == Verdict.CONFIRMED)
     likely = sum(1 for v in validations if v.verdict == Verdict.LIKELY)
@@ -120,17 +120,3 @@ For each finding:
     console.print(f"  [red]False positives: {fp}[/red]")
 
     return validations
-
-
-def _parse_validations(raw: str) -> list[ValidationResult]:
-    """Parse the model's JSON response into ValidationResult objects."""
-    start = raw.find("[")
-    end = raw.rfind("]") + 1
-    if start == -1 or end == 0:
-        return []
-
-    try:
-        data = json.loads(raw[start:end])
-        return [ValidationResult(**item) for item in data]
-    except (json.JSONDecodeError, ValueError):
-        return []

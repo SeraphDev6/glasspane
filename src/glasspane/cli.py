@@ -9,6 +9,7 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 
@@ -17,14 +18,14 @@ from rich.console import Console
 from rich.panel import Panel
 
 from glasspane import __version__
-from glasspane.config import load_config, resolve_api_key, write_default_config
+from glasspane.config import load_config, write_default_config
 from glasspane.models import ScanConfig, ScanResult
 from glasspane.phases.analyze import run_analyze_phase
 from glasspane.phases.rank import run_rank_phase
 from glasspane.phases.report import run_report_phase
 from glasspane.phases.validate import run_validate_phase
 from glasspane.profiles import detect_profile, get_profile, list_profiles
-from glasspane.sandbox import Sandbox
+from glasspane.sandbox import GlasspaneSandbox
 
 app = typer.Typer(
     name="glasspane",
@@ -49,13 +50,42 @@ def scan(
     min_rank: int | None = typer.Option(None, "--min-rank", help="Minimum file rank to deep-scan (1-5)"),
     max_files: int | None = typer.Option(None, "--max-files", help="Maximum files to deep-scan"),
     skip_validate: bool = typer.Option(False, "--skip-validate", help="Skip the validation phase"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show all tool calls instead of a single status line"),
 ) -> None:
     """Scan a repository for security vulnerabilities."""
+    asyncio.run(_scan_async(
+        target, output, profile, rank_model, analyze_model, validate_model,
+        parallel, min_rank, max_files, skip_validate, verbose,
+    ))
+
+
+async def _scan_async(
+    target: Path,
+    output: str | None,
+    profile: str | None,
+    rank_model: str | None,
+    analyze_model: str | None,
+    validate_model: str | None,
+    parallel: int | None,
+    min_rank: int | None,
+    max_files: int | None,
+    skip_validate: bool,
+    verbose: bool,
+) -> None:
+    """Async implementation of the scan command."""
     # Load config file defaults
     cfg = load_config()
 
     # Resolve: CLI flag > config file > hardcoded default
-    output_path = Path(output or cfg.output_dir).resolve()
+    raw_output = Path(output or cfg.output_dir)
+    # Reject symlinks to prevent a malicious repo from redirecting output
+    if raw_output.exists() and raw_output.is_symlink():
+        console.print(
+            f"[red]Error: output path {raw_output} is a symlink — refusing to follow. "
+            f"Use --output to specify a direct path.[/red]"
+        )
+        raise typer.Exit(1)
+    output_path = raw_output.resolve()
     profile_name = profile or cfg.default_profile
     r_model = rank_model or cfg.rank_model
     a_model = analyze_model or cfg.analyze_model
@@ -63,13 +93,6 @@ def scan(
     n_parallel = parallel or cfg.parallel
     n_min_rank = min_rank or cfg.min_rank
     n_max_files = max_files or cfg.max_files
-
-    # Resolve API key
-    api_key = resolve_api_key(cfg)
-    if not api_key:
-        console.print(f"[red]Error: Set {cfg.api_key_env} environment variable with your Anthropic API key.[/red]")
-        console.print(f"[dim]Configure which env var to use in ~/.glasspane/config.yml (api_key_env)[/dim]")
-        raise typer.Exit(1)
 
     # Validate target
     target = target.resolve()
@@ -107,21 +130,23 @@ def scan(
         max_files_to_analyze=n_max_files,
         min_rank_to_analyze=n_min_rank,
         parallel_agents=n_parallel,
-        api_key=api_key,
     )
 
     # Start sandbox — repo mounted read-only, no network
-    with Sandbox(config.target_path, config.output_path) as sandbox:
+    sandbox = GlasspaneSandbox(config.target_path, config.output_path)
+    try:
         # Phase 1: RANK
-        rankings = run_rank_phase(config, scan_profile, sandbox)
+        rankings = await run_rank_phase(config, scan_profile, sandbox, verbose=verbose)
 
         # Phase 2: ANALYZE
-        findings = run_analyze_phase(config, scan_profile, rankings, sandbox)
+        findings = await run_analyze_phase(config, scan_profile, rankings, sandbox, verbose=verbose)
 
         # Phase 3: VALIDATE
         validations = []
         if not skip_validate and findings:
-            validations = run_validate_phase(config, scan_profile, findings, sandbox)
+            validations = await run_validate_phase(config, scan_profile, findings, sandbox, verbose=verbose)
+    finally:
+        sandbox.stop()
 
     # Build result
     elapsed = time.time() - start_time
@@ -158,7 +183,11 @@ def init() -> None:
     console.print(f"Config written to [bold]{path}[/bold]")
     console.print()
     console.print("Next steps:")
-    console.print(f"  1. Set your API key: [cyan]export ANTHROPIC_API_KEY=sk-ant-...[/cyan]")
+    console.print(f"  1. Set your provider's API key:")
+    console.print(f"     [cyan]export ANTHROPIC_API_KEY=...[/cyan]          (Anthropic)")
+    console.print(f"     [cyan]export OPENAI_API_KEY=...[/cyan]             (OpenAI)")
+    console.print(f"     [cyan]export AZURE_OPENAI_ENDPOINT=... + KEY[/cyan] (Azure OpenAI)")
+    console.print(f"     [dim]AWS credentials for Bedrock, GOOGLE_API_KEY for Google, etc.[/dim]")
     console.print(f"  2. Edit config:      [cyan]{path}[/cyan]")
     console.print(f"  3. Run a scan:       [cyan]glasspane scan /path/to/repo[/cyan]")
 

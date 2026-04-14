@@ -129,10 +129,17 @@ def detect_profile(target_path) -> str:
     best_name = "generic"
     best_score = 0
 
+    resolved_target = target.resolve()
+
     for name, profile in external.items():
         score = 0
         for pattern in profile.file_patterns:
-            score += len(list(target.rglob(pattern))[:100])  # Cap at 100 to avoid slow globs
+            # Reject patterns that could escape the target directory
+            if ".." in pattern or Path(pattern).is_absolute():
+                continue
+            for match in list(target.rglob(pattern))[:100]:
+                if match.resolve().is_relative_to(resolved_target):
+                    score += 1
         if score > best_score:
             best_score = score
             best_name = name

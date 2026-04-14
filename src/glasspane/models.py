@@ -63,6 +63,24 @@ class ValidationResult(BaseModel):
     poc_suggestion: str = ""
 
 
+class RankOutput(BaseModel):
+    """Structured output from the RANK phase."""
+
+    rankings: list[FileRanking]
+
+
+class AnalyzeOutput(BaseModel):
+    """Structured output from the ANALYZE phase."""
+
+    findings: list[Finding]
+
+
+class ValidateOutput(BaseModel):
+    """Structured output from the VALIDATE phase."""
+
+    validations: list[ValidationResult]
+
+
 class ScanProfile(BaseModel):
     """Configuration profile for a specific ecosystem/language."""
 
@@ -84,14 +102,13 @@ class ScanConfig(BaseModel):
     target_path: Path
     output_path: Path = Path("./glasspane-output")
     profile: str = "auto"
-    rank_model: str = "claude-sonnet-4-6-20250514"
-    analyze_model: str = "claude-opus-4-6-20250514"
-    validate_model: str = "claude-opus-4-6-20250514"
+    rank_model: str = "anthropic:claude-sonnet-4-6"
+    analyze_model: str = "anthropic:claude-opus-4-6"
+    validate_model: str = "anthropic:claude-opus-4-6"
     max_files_to_analyze: int = 30
     min_rank_to_analyze: int = 4
     generate_poc: bool = True
     parallel_agents: int = 3
-    api_key: str = ""
 
 
 class ScanResult(BaseModel):
