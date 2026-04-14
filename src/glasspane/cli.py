@@ -1,0 +1,190 @@
+"""Glasspane CLI — AI-powered security scanning scaffold.
+
+Usage:
+    glasspane scan /path/to/repo
+    glasspane scan /path/to/repo --profile drupal
+    glasspane scan /path/to/repo --output ./results --parallel 5
+    glasspane init  # create default config at ~/.glasspane/config.yml
+"""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+import typer
+from rich.console import Console
+from rich.panel import Panel
+
+from glasspane import __version__
+from glasspane.config import load_config, resolve_api_key, write_default_config
+from glasspane.models import ScanConfig, ScanResult
+from glasspane.phases.analyze import run_analyze_phase
+from glasspane.phases.rank import run_rank_phase
+from glasspane.phases.report import run_report_phase
+from glasspane.phases.validate import run_validate_phase
+from glasspane.profiles import detect_profile, get_profile, list_profiles
+from glasspane.sandbox import Sandbox
+
+app = typer.Typer(
+    name="glasspane",
+    help="AI-powered security scanning scaffold",
+    no_args_is_help=True,
+)
+console = Console()
+
+# Sentinel value so we can detect "user didn't pass this flag"
+_UNSET = "__UNSET__"
+
+
+@app.command()
+def scan(
+    target: Path = typer.Argument(..., help="Path to the repository to scan"),
+    output: str | None = typer.Option(None, "--output", "-o", help="Output directory (default: from config)"),
+    profile: str | None = typer.Option(None, "--profile", "-p", help="Scan profile (default: auto-detect)"),
+    rank_model: str | None = typer.Option(None, "--rank-model", help="Model for ranking phase"),
+    analyze_model: str | None = typer.Option(None, "--analyze-model", help="Model for analysis phase"),
+    validate_model: str | None = typer.Option(None, "--validate-model", help="Model for validation phase"),
+    parallel: int | None = typer.Option(None, "--parallel", "-j", help="Number of parallel analysis agents"),
+    min_rank: int | None = typer.Option(None, "--min-rank", help="Minimum file rank to deep-scan (1-5)"),
+    max_files: int | None = typer.Option(None, "--max-files", help="Maximum files to deep-scan"),
+    skip_validate: bool = typer.Option(False, "--skip-validate", help="Skip the validation phase"),
+) -> None:
+    """Scan a repository for security vulnerabilities."""
+    # Load config file defaults
+    cfg = load_config()
+
+    # Resolve: CLI flag > config file > hardcoded default
+    output_path = Path(output or cfg.output_dir).resolve()
+    profile_name = profile or cfg.default_profile
+    r_model = rank_model or cfg.rank_model
+    a_model = analyze_model or cfg.analyze_model
+    v_model = validate_model or cfg.validate_model
+    n_parallel = parallel or cfg.parallel
+    n_min_rank = min_rank or cfg.min_rank
+    n_max_files = max_files or cfg.max_files
+
+    # Resolve API key
+    api_key = resolve_api_key(cfg)
+    if not api_key:
+        console.print(f"[red]Error: Set {cfg.api_key_env} environment variable with your Anthropic API key.[/red]")
+        console.print(f"[dim]Configure which env var to use in ~/.glasspane/config.yml (api_key_env)[/dim]")
+        raise typer.Exit(1)
+
+    # Validate target
+    target = target.resolve()
+    if not target.is_dir():
+        console.print(f"[red]Error: {target} is not a directory[/red]")
+        raise typer.Exit(1)
+
+    # Banner
+    console.print(Panel(
+        f"[bold]Glasspane v{__version__}[/bold] — AI-powered security scanning\n"
+        f"Target: {target}\n"
+        f"Output: {output_path}",
+        title="Security Scan",
+        border_style="blue",
+    ))
+
+    start_time = time.time()
+
+    # Detect or use specified profile
+    if profile_name == "auto":
+        profile_name = detect_profile(target)
+        console.print(f"Auto-detected profile: [bold]{profile_name}[/bold]")
+
+    scan_profile = get_profile(profile_name)
+    console.print(f"Profile: [bold]{scan_profile.name}[/bold] — {scan_profile.description}")
+    console.print(f"Models: rank=[cyan]{r_model}[/cyan] analyze=[cyan]{a_model}[/cyan] validate=[cyan]{v_model}[/cyan]")
+
+    config = ScanConfig(
+        target_path=target,
+        output_path=output_path,
+        profile=profile_name,
+        rank_model=r_model,
+        analyze_model=a_model,
+        validate_model=v_model,
+        max_files_to_analyze=n_max_files,
+        min_rank_to_analyze=n_min_rank,
+        parallel_agents=n_parallel,
+        api_key=api_key,
+    )
+
+    # Start sandbox — repo mounted read-only, no network
+    with Sandbox(config.target_path, config.output_path) as sandbox:
+        # Phase 1: RANK
+        rankings = run_rank_phase(config, scan_profile, sandbox)
+
+        # Phase 2: ANALYZE
+        findings = run_analyze_phase(config, scan_profile, rankings, sandbox)
+
+        # Phase 3: VALIDATE
+        validations = []
+        if not skip_validate and findings:
+            validations = run_validate_phase(config, scan_profile, findings, sandbox)
+
+    # Build result
+    elapsed = time.time() - start_time
+    result = ScanResult(
+        target=str(target),
+        profile=profile_name,
+        rankings=rankings,
+        findings=findings,
+        validations=validations,
+        total_files_discovered=len(rankings),
+        total_files_ranked=len(rankings),
+        total_files_analyzed=sum(1 for r in rankings if r.rank >= config.min_rank_to_analyze),
+        scan_duration_seconds=elapsed,
+    )
+
+    # Phase 5: REPORT
+    run_report_phase(config, scan_profile, result)
+
+    # Final summary
+    confirmed = len([v for v in validations if v.verdict.value in ("confirmed", "likely")])
+    console.print(Panel(
+        f"[bold green]Scan complete[/bold green] in {elapsed:.0f}s\n"
+        f"Findings: {len(findings)} raw, {confirmed} confirmed/likely\n"
+        f"Reports: {config.output_path}",
+        title="Done",
+        border_style="green",
+    ))
+
+
+@app.command()
+def init() -> None:
+    """Create default config at ~/.glasspane/config.yml."""
+    path = write_default_config()
+    console.print(f"Config written to [bold]{path}[/bold]")
+    console.print()
+    console.print("Next steps:")
+    console.print(f"  1. Set your API key: [cyan]export ANTHROPIC_API_KEY=sk-ant-...[/cyan]")
+    console.print(f"  2. Edit config:      [cyan]{path}[/cyan]")
+    console.print(f"  3. Run a scan:       [cyan]glasspane scan /path/to/repo[/cyan]")
+
+
+@app.command()
+def profiles() -> None:
+    """List available scan profiles."""
+    from glasspane.profiles import list_profiles, _profiles_dir
+
+    all_profiles = list_profiles()
+    console.print(f"\nProfiles directory: [dim]{_profiles_dir()}[/dim]\n")
+
+    for name, p in all_profiles.items():
+        badge = "[green]built-in[/green]" if name == "generic" else "[cyan]external[/cyan]"
+        console.print(f"[bold]{name}[/bold] {badge} — {p.description}")
+        console.print(f"  Language: {p.language}")
+        console.print(f"  File patterns: {', '.join(p.file_patterns)}")
+        console.print(f"  Vulnerability classes: {len(p.vuln_classes)}")
+        console.print()
+
+
+@app.command()
+def version() -> None:
+    """Show version."""
+    console.print(f"glasspane v{__version__}")
+
+
+if __name__ == "__main__":
+    app()

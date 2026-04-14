@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+.venv/
+venv/
+
+# Glasspane IP — profiles are the secret sauce
+~/.glasspane/
+profiles/*.yml
+profiles/*.yaml
+
+# Scan outputs — never commit client findings
+glasspane-output/
+
+# Our research — not part of the open source scaffold
+findings/
+targets/
+poc/
+methodology/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
