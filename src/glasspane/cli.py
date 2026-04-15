@@ -132,8 +132,10 @@ async def _scan_async(
         parallel_agents=n_parallel,
     )
 
-    # Start sandbox — repo mounted read-only, no network
+    # Start sandbox eagerly — avoids race condition when parallel agents
+    # trigger _ensure_container() from multiple threads simultaneously
     sandbox = GlasspaneSandbox(config.target_path, config.output_path)
+    sandbox.start()
     try:
         # Phase 1: RANK
         rankings = await run_rank_phase(config, scan_profile, sandbox, verbose=verbose)
