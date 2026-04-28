@@ -90,9 +90,20 @@ class GlasspaneSandbox(DockerSandbox):
     """DockerSandbox with read-only repo mount and glasspane-specific config."""
 
     def __init__(self, repo_path: Path, output_path: Path):
+        # Re-check symlinks immediately before use to close the TOCTOU window
+        # between the CLI check and the actual volume mount.
+        if repo_path.is_symlink():
+            raise ValueError(f"Target path is a symlink — refusing to mount: {repo_path}")
         self._repo_path = repo_path.resolve()
+
+        if output_path.is_symlink():
+            raise ValueError(f"Output path is a symlink — refusing to mount: {output_path}")
         self._output_path = output_path.resolve()
         self._output_path.mkdir(parents=True, exist_ok=True)
+
+        # Verify output path wasn't swapped for a symlink between mkdir and use
+        if self._output_path.is_symlink():
+            raise ValueError(f"Output path became a symlink after creation — refusing to mount: {self._output_path}")
 
         _ensure_image()
 

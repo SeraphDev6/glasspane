@@ -78,8 +78,8 @@ async def _scan_async(
 
     # Resolve: CLI flag > config file > hardcoded default
     raw_output = Path(output or cfg.output_dir)
-    # Reject symlinks to prevent a malicious repo from redirecting output
-    if raw_output.exists() and raw_output.is_symlink():
+    # Reject symlinks (is_symlink uses lstat — works on dangling symlinks too)
+    if raw_output.is_symlink():
         console.print(
             f"[red]Error: output path {raw_output} is a symlink — refusing to follow. "
             f"Use --output to specify a direct path.[/red]"
@@ -94,7 +94,13 @@ async def _scan_async(
     n_min_rank = min_rank or cfg.min_rank
     n_max_files = max_files or cfg.max_files
 
-    # Validate target
+    # Validate target — reject symlinks just like the output path
+    if target.is_symlink():
+        console.print(
+            f"[red]Error: target path {target} is a symlink — refusing to follow. "
+            f"Pass the real directory path instead.[/red]"
+        )
+        raise typer.Exit(1)
     target = target.resolve()
     if not target.is_dir():
         console.print(f"[red]Error: {target} is not a directory[/red]")

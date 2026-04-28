@@ -11,8 +11,12 @@ engineering that make scans actually find bugs.
 
 from __future__ import annotations
 
+import itertools
+import logging
 import os
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 import yaml
 
@@ -76,8 +80,8 @@ def _load_external_profiles() -> dict[str, ScanProfile]:
             profile = ScanProfile(**data)
             name = path.stem
             external[name] = profile
-        except Exception:
-            # Skip malformed profiles silently
+        except Exception as exc:
+            logger.warning("Skipping malformed profile %s: %s", path.name, type(exc).__name__)
             continue
 
     for path in sorted(profiles_dir.glob("*.yaml")):
@@ -86,7 +90,8 @@ def _load_external_profiles() -> dict[str, ScanProfile]:
             profile = ScanProfile(**data)
             name = path.stem
             external[name] = profile
-        except Exception:
+        except Exception as exc:
+            logger.warning("Skipping malformed profile %s: %s", path.name, type(exc).__name__)
             continue
 
     return external
@@ -137,7 +142,7 @@ def detect_profile(target_path) -> str:
             # Reject patterns that could escape the target directory
             if ".." in pattern or Path(pattern).is_absolute():
                 continue
-            for match in list(target.rglob(pattern))[:100]:
+            for match in itertools.islice(target.rglob(pattern), 100):
                 if match.resolve().is_relative_to(resolved_target):
                     score += 1
         if score > best_score:
