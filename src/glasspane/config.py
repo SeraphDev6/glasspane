@@ -1,12 +1,12 @@
 """User configuration — loads defaults from ~/.glasspane/config.yml.
 
 Config file is optional. CLI flags override config file values.
-API key is NEVER stored in the config — only the name of the env var to read.
+API keys are managed via standard environment variables for each provider
+(e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY).
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import yaml
@@ -18,13 +18,12 @@ DEFAULT_CONFIG_PATH = Path.home() / ".glasspane" / "config.yml"
 class UserConfig(BaseModel):
     """User defaults loaded from config file."""
 
-    api_key_env: str = Field(default="ANTHROPIC_API_KEY", description="Environment variable containing the API key")
-    rank_model: str = "claude-sonnet-4-6-20250514"
-    analyze_model: str = "claude-opus-4-6-20250514"
-    validate_model: str = "claude-opus-4-6-20250514"
-    parallel: int = 3
-    min_rank: int = 4
-    max_files: int = 30
+    rank_model: str = "anthropic:claude-sonnet-4-6"
+    analyze_model: str = "anthropic:claude-opus-4-6"
+    validate_model: str = "anthropic:claude-opus-4-6"
+    parallel: int = Field(3, ge=1, le=32)
+    min_rank: int = Field(4, ge=1, le=5)
+    max_files: int = Field(30, ge=1, le=1000)
     default_profile: str = "auto"
     output_dir: str = "./glasspane-output"
 
@@ -45,11 +44,6 @@ def load_config(path: Path | None = None) -> UserConfig:
         return UserConfig()
 
 
-def resolve_api_key(config: UserConfig) -> str:
-    """Read the API key from the configured environment variable."""
-    return os.environ.get(config.api_key_env, "")
-
-
 def write_default_config(path: Path | None = None) -> Path:
     """Write a default config file with comments."""
     config_path = path or DEFAULT_CONFIG_PATH
@@ -58,14 +52,31 @@ def write_default_config(path: Path | None = None) -> Path:
     content = """# Glasspane configuration
 # Docs: https://github.com/seraphdev-llc/glasspane
 
-# Environment variable containing your Anthropic API key.
-# The key itself is NEVER stored here — only the env var name.
-api_key_env: ANTHROPIC_API_KEY
-
-# Models — override per-phase if needed
-rank_model: claude-sonnet-4-6-20250514
-analyze_model: claude-opus-4-6-20250514
-validate_model: claude-opus-4-6-20250514
+# Models use the provider:model format supported by pydantic-ai.
+# Set the appropriate API key env var for your provider:
+#
+#   Anthropic:     export ANTHROPIC_API_KEY=...
+#   OpenAI:        export OPENAI_API_KEY=...
+#   Azure OpenAI:  export AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com
+#                  export AZURE_OPENAI_API_KEY=...
+#                  export OPENAI_API_VERSION=2024-12-01-preview
+#   AWS Bedrock:   export AWS_DEFAULT_REGION=us-east-1  (+ AWS credentials)
+#   Google:        export GOOGLE_API_KEY=...
+#   Groq:          export GROQ_API_KEY=...
+#
+# Install provider extras as needed:
+#   pip install glasspane[azure]     # Azure OpenAI
+#   pip install glasspane[bedrock]   # AWS Bedrock
+#   pip install glasspane[all]       # All providers
+#
+# Examples:
+#   anthropic:claude-sonnet-4-6          openai:gpt-4o
+#   anthropic:claude-opus-4-6            openai:o3
+#   azure:gpt-5.4                        google-gla:gemini-2.5-pro
+#   bedrock:anthropic.claude-sonnet-4-6  groq:llama-3.3-70b-versatile
+rank_model: anthropic:claude-sonnet-4-6
+analyze_model: anthropic:claude-opus-4-6
+validate_model: anthropic:claude-opus-4-6
 
 # Scan defaults
 parallel: 3          # Number of parallel analysis agents

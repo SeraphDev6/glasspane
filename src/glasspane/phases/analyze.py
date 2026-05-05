@@ -7,17 +7,21 @@ full source code reading and call-chain tracing.
 
 from __future__ import annotations
 
-import json
+import asyncio
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 
 from rich.console import Console
-from rich.progress import Progress
 
-from glasspane.client import get_client, run_agent_loop
-from glasspane.models import FileRanking, Finding, ScanConfig, ScanProfile, Severity
-from glasspane.sandbox import Sandbox
+from glasspane.client import create_deps, create_phase_agent
+from glasspane.models import (
+    AnalyzeOutput,
+    FileRanking,
+    Finding,
+    ScanConfig,
+    ScanProfile,
+    Severity,
+)
+from glasspane.sandbox import GlasspaneSandbox
 
 console = Console()
 
@@ -44,39 +48,21 @@ FRAMEWORK MITIGATIONS — account for these (only report findings that bypass th
 
 {profile_additions}
 
-Use the read_file, grep, and list_files tools to:
+Use the available tools to:
 - Read the full source of each target file
 - Trace call chains from user input to dangerous operations
 - Check if related files provide context (e.g., how a function is called)
 - Look for inconsistencies (one path sanitized, another not — like the LDAP module)
 
-After your analysis, respond with a JSON array of Finding objects. Output ONLY the JSON array.
-
-Example:
-[
-  {{
-    "id": "FIND-001",
-    "title": "LDAP Injection in Views Query Plugin",
-    "severity": "high",
-    "cwe": "CWE-90",
-    "file_path": "src/Plugin/views/query/LdapQuery.php",
-    "line_number": 409,
-    "description": "Html::escape() used instead of ldap_escape(). LDAP metacharacters pass through.",
-    "code_snippet": "$condition = sprintf('(%s=%s)', $field, Html::escape($value));",
-    "attack_vector": "Anonymous user submits * or )( via exposed Views filter",
-    "impact": "Blind LDAP data extraction of any attribute in the directory",
-    "recommendation": "Replace Html::escape($value) with ldap_escape($value, '', LDAP_ESCAPE_FILTER)",
-    "confidence": "high",
-    "chain_with": []
-  }}
-]"""
+After your analysis, return your findings as structured output."""
 
 
-def run_analyze_phase(
+async def run_analyze_phase(
     config: ScanConfig,
     profile: ScanProfile,
     rankings: list[FileRanking],
-    sandbox: Sandbox,
+    sandbox: GlasspaneSandbox,
+    verbose: bool = False,
 ) -> list[Finding]:
     """Deep scan high-priority files for vulnerabilities."""
     console.print("\n[bold blue]Phase 2: ANALYZE[/bold blue] — Deep scanning high-priority files...")
@@ -93,42 +79,31 @@ def run_analyze_phase(
     console.print(f"  Analyzing [bold]{len(targets)}[/bold] files (rank >= {config.min_rank_to_analyze})")
     console.print(f"  Using model: [cyan]{config.analyze_model}[/cyan]")
 
-    # Group files into batches for parallel agents (like we did with modules)
+    # Group files into batches for parallel agents
     batches = _create_batches(targets, config.parallel_agents)
-
-    all_findings: list[Finding] = []
-    client = get_client()
 
     vuln_checklist = "\n".join(f"- {vc}" for vc in profile.vuln_classes)
 
-    with ThreadPoolExecutor(max_workers=config.parallel_agents) as executor:
-        futures = {}
-        for i, batch in enumerate(batches):
-            future = executor.submit(
-                _analyze_batch,
-                client,
-                config,
-                profile,
-                batch,
-                vuln_checklist,
-                i + 1,
-                sandbox,
-            )
-            futures[future] = i + 1
+    # Run batches in parallel using asyncio
+    tasks = [
+        _analyze_batch(config, profile, batch, vuln_checklist, i + 1, sandbox, verbose)
+        for i, batch in enumerate(batches)
+    ]
+    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        for future in as_completed(futures):
-            batch_num = futures[future]
-            try:
-                findings = future.result()
-                all_findings.extend(findings)
-                console.print(f"  Agent {batch_num} complete: [bold]{len(findings)}[/bold] findings")
-            except Exception as e:
-                console.print(f"  [red]Agent {batch_num} failed: {e}[/red]")
+    all_findings: list[Finding] = []
+    for i, result in enumerate(batch_results):
+        batch_num = i + 1
+        if isinstance(result, Exception):
+            console.print(f"  [red]Agent {batch_num} failed: {result}[/red]")
+        else:
+            all_findings.extend(result)
+            console.print(f"  Agent {batch_num} complete: [bold]{len(result)}[/bold] findings")
 
     # Deduplicate findings by file+line
     all_findings = _deduplicate(all_findings)
 
-    by_severity = {}
+    by_severity: dict[Severity, int] = {}
     for f in all_findings:
         by_severity[f.severity] = by_severity.get(f.severity, 0) + 1
 
@@ -150,16 +125,16 @@ def _create_batches(targets: list[FileRanking], num_batches: int) -> list[list[F
     return [b for b in batches if b]
 
 
-def _analyze_batch(
-    client,
+async def _analyze_batch(
     config: ScanConfig,
     profile: ScanProfile,
     batch: list[FileRanking],
     vuln_checklist: str,
     batch_num: int,
-    sandbox: Sandbox,
+    sandbox: GlasspaneSandbox,
+    verbose: bool = False,
 ) -> list[Finding]:
-    """Analyze a batch of files using a single agent loop."""
+    """Analyze a batch of files using a pydantic-deep agent."""
     file_list = "\n".join(
         f"- {r.path} (rank {r.rank}): {r.rationale}"
         + (f" [CHAIN CANDIDATE: {r.chain_notes}]" if r.chain_candidate else "")
@@ -180,41 +155,32 @@ Read each file in full. Trace user input from entry points through processing to
 Check for inconsistencies in security patterns (one path sanitized, another not).
 Look for chain opportunities between files marked as chain candidates.
 
-Report ALL findings as a JSON array."""
+Report ALL findings as structured output."""
 
-    raw = run_agent_loop(
-        client=client,
+    agent, activity = create_phase_agent(
         model=config.analyze_model,
-        system_prompt=system,
-        user_message=user_msg,
+        instructions=system,
+        output_type=AnalyzeOutput,
         sandbox=sandbox,
+        verbose=verbose,
     )
+    deps = create_deps(sandbox)
 
-    return _parse_findings(raw, batch_num)
+    result = await agent.run(user_msg, deps=deps)
+    activity.clear_line()
+    findings = result.output.findings
 
+    # Ensure all findings have IDs
+    for f in findings:
+        if not f.id:
+            f.id = f"FIND-{batch_num}-{uuid.uuid4().hex[:6]}"
 
-def _parse_findings(raw: str, batch_num: int) -> list[Finding]:
-    """Parse the model's JSON response into Finding objects."""
-    start = raw.find("[")
-    end = raw.rfind("]") + 1
-    if start == -1 or end == 0:
-        return []
-
-    try:
-        data = json.loads(raw[start:end])
-        findings = []
-        for item in data:
-            if "id" not in item or not item["id"]:
-                item["id"] = f"FIND-{batch_num}-{uuid.uuid4().hex[:6]}"
-            findings.append(Finding(**item))
-        return findings
-    except (json.JSONDecodeError, ValueError):
-        return []
+    return findings
 
 
 def _deduplicate(findings: list[Finding]) -> list[Finding]:
     """Remove duplicate findings (same file + similar line number)."""
-    seen = set()
+    seen: set[tuple[str, int | None, str]] = set()
     unique = []
     for f in findings:
         key = (f.file_path, f.line_number, f.title[:50])
